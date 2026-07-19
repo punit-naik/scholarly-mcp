@@ -5,6 +5,15 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-07-19
+
+### Added
+- Implemented `summarize_paper` MCP tool with a multi-tiered LLM orchestration pipeline (client-side sampling via PluMCP, server-side fallbacks to Gemini, OpenAI, and Anthropic, and local structural parsing).
+- Integrated JSoup and Apache PDFBox for HTML and PDF document text extraction.
+- Centralized server-side LLM interactions into a dedicated `llm_api` module.
+- Added comprehensive unit and integration tests covering document parsing and JSON-RPC tool callbacks.
+- Added complete standard Clojure docstrings and structured observability with `org.clojure/tools.logging` and `slf4j-simple`.
+
 ## [0.1.2] - 2026-07-19
 
 ### Fixed

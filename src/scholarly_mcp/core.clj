@@ -9,7 +9,7 @@
 
 (def info
   "Metadata information about the Scholarly MCP Server."
-  (es/make-info "Scholarly MCP Server" "0.1.0"))
+  (es/make-info "Scholarly MCP Server" "0.2.0"))
 
 
 (defn -main
