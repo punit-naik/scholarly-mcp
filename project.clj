@@ -7,7 +7,9 @@
                  [io.github.plumce/plumcp.core-json-cheshire "0.2.2"]
                  [clj-http "3.13.1"]
                  [cheshire "6.2.0"]
-                 [org.apache.lucene/lucene-analysis-common "10.5.0"]]
+                 [org.apache.lucene/lucene-analysis-common "10.5.0"]
+                 [org.clojure/tools.logging "1.3.1"]
+                 [org.slf4j/slf4j-simple "2.0.17"]]
   :main scholarly-mcp.core
   :uberjar-name "scholarly-mcp.jar"
   :profiles {:uberjar {:aot :all}})

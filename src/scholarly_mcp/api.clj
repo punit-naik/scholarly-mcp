@@ -1,31 +1,44 @@
 (ns scholarly-mcp.api
+  "Academic database REST client integrations."
   (:require
     [cheshire.core :as json]
     [clj-http.client :as http]
     [clojure.string :as string]
+    [clojure.tools.logging :as log]
     [clojure.xml :as xml])
   (:import
     (java.io
       ByteArrayInputStream)))
 
 
-;; Polite headers for rate limit pooling
 (def default-headers
+  "Polite request headers identifying this MCP server for academic APIs."
   {"User-Agent" "ResearchMCP/0.1.0 (mailto:punit.naik@gmail.com; local development)"})
 
 
 (defn log-error
+  "Log an error message to both standard error and tools.logging."
   [& args]
-  (binding [*out* *err*]
-    (apply println args)))
+  (let [msg (string/join " " args)]
+    (log/error msg)
+    (binding [*out* *err*]
+      (println msg))))
 
 
 (defn safe-json-parse
+  "Parse a JSON string safely, returning nil on exception."
   [s]
   (try
     (json/parse-string s true)
-    (catch Exception _
+    (catch Exception e
+      (log/debug e "Failed to parse JSON string")
       nil)))
+
+
+(defn env-var
+  "Retrieve an environment variable by name."
+  [name]
+  (System/getenv name))
 
 
 ;; ==========================================
@@ -33,6 +46,7 @@
 ;; ==========================================
 
 (defn reconstruct-abstract
+  "Reconstruct paper abstract from OpenAlex's inverted index representation."
   [inverted-index]
   (when (seq inverted-index)
     (let [words (for [[word positions] inverted-index
@@ -43,50 +57,61 @@
 
 
 (defn search-openalex
+  "Search papers on OpenAlex using the provided query."
   [query]
   (try
+    (log/info "Searching OpenAlex for query:" query)
     (let [url "https://api.openalex.org/works"
           resp (http/get url {:headers default-headers
                               :query-params {:search query
                                              :per_page 10}})
-          body (safe-json-parse (:body resp))]
-      (map (fn [item]
-             {:source "OpenAlex"
-              :id (:id item)
-              :title (:title item)
-              :doi (:doi item)
-              :year (:publication_year item)
-              :authors (map #(get-in % [:author :display_name]) (:authorships item))
-              :venue (get-in item [:primary_location :source :display_name])
-              :abstract (reconstruct-abstract (:abstract_inverted_index item))
-              :citation-count (:cited_by_count item)
-              :is-oa (get-in item [:open_access :is_oa])
-              :oa-url (get-in item [:open_access :oa_url])})
-           (:results body)))
+          body (safe-json-parse (:body resp))
+          results (map (fn [item]
+                         {:source "OpenAlex"
+                          :id (:id item)
+                          :title (:title item)
+                          :doi (:doi item)
+                          :year (:publication_year item)
+                          :authors (map #(get-in % [:author :display_name]) (:authorships item))
+                          :venue (get-in item [:primary_location :source :display_name])
+                          :abstract (reconstruct-abstract (:abstract_inverted_index item))
+                          :citation-count (:cited_by_count item)
+                          :is-oa (get-in item [:open_access :is_oa])
+                          :oa-url (get-in item [:open_access :oa_url])})
+                       (:results body))]
+      (log/info "OpenAlex query returned" (count results) "results")
+      results)
     (catch Exception e
       (log-error "OpenAlex search error:" (.getMessage e))
       [])))
 
 
 (defn fetch-openalex-by-doi
+  "Fetch paper metadata from OpenAlex by its DOI."
   [doi]
   (try
+    (log/info "Fetching OpenAlex metadata for DOI:" doi)
     (let [clean-doi (string/replace doi #"https?://(dx\.)?doi\.org/" "")
           url (str "https://api.openalex.org/works/https://doi.org/" clean-doi)
           resp (http/get url {:headers default-headers})
           item (safe-json-parse (:body resp))]
-      (when item
-        {:source "OpenAlex"
-         :id (:id item)
-         :title (:title item)
-         :doi (:doi item)
-         :year (:publication_year item)
-         :authors (map #(get-in % [:author :display_name]) (:authorships item))
-         :venue (get-in item [:primary_location :source :display_name])
-         :abstract (reconstruct-abstract (:abstract_inverted_index item))
-         :citation-count (:cited_by_count item)
-         :is-oa (get-in item [:open_access :is_oa])
-         :oa-url (get-in item [:open_access :oa_url])}))
+      (if item
+        (do
+          (log/info "Found OpenAlex metadata for DOI:" doi)
+          {:source "OpenAlex"
+           :id (:id item)
+           :title (:title item)
+           :doi (:doi item)
+           :year (:publication_year item)
+           :authors (map #(get-in % [:author :display_name]) (:authorships item))
+           :venue (get-in item [:primary_location :source :display_name])
+           :abstract (reconstruct-abstract (:abstract_inverted_index item))
+           :citation-count (:cited_by_count item)
+           :is-oa (get-in item [:open_access :is_oa])
+           :oa-url (get-in item [:open_access :oa_url])})
+        (do
+          (log/warn "No paper found in OpenAlex for DOI:" doi)
+          nil)))
     (catch Exception e
       (log-error "OpenAlex fetch by DOI error:" (.getMessage e))
       nil)))
@@ -97,10 +122,12 @@
 ;; ==========================================
 
 (defn search-semantic-scholar
+  "Search papers on Semantic Scholar using the provided query."
   [query]
   (try
+    (log/info "Searching Semantic Scholar for query:" query)
     (let [url "https://api.semanticscholar.org/graph/v1/paper/search"
-          api-key (System/getenv "SEMANTIC_SCHOLAR_API_KEY")
+          api-key (env-var "SEMANTIC_SCHOLAR_API_KEY")
           headers (if api-key
                     (assoc default-headers "x-api-key" api-key)
                     default-headers)
@@ -108,48 +135,54 @@
                               :query-params {:query query
                                              :limit 10
                                              :fields "title,authors,year,externalIds,citationCount,abstract,url,venue"}})
-          body (safe-json-parse (:body resp))]
-      (map (fn [item]
-             {:source "Semantic Scholar"
-              :id (:paperId item)
-              :title (:title item)
-              :doi (get-in item [:externalIds :DOI])
-              :year (:year item)
-              :authors (map :name (:authors item))
-              :venue (:venue item)
-              :abstract (:abstract item)
-              :citation-count (:citationCount item)
-              :url (:url item)})
-           (:data body)))
+          body (safe-json-parse (:body resp))
+          results (map (fn [item]
+                         {:source "Semantic Scholar"
+                          :id (:paperId item)
+                          :title (:title item)
+                          :doi (get-in item [:externalIds :DOI])
+                          :year (:year item)
+                          :authors (map :name (:authors item))
+                          :venue (:venue item)
+                          :abstract (:abstract item)
+                          :citation-count (:citationCount item)
+                          :url (:url item)})
+                       (:data body))]
+      (log/info "Semantic Scholar query returned" (count results) "results")
+      results)
     (catch Exception e
       (log-error "Semantic Scholar search error:" (.getMessage e))
       [])))
 
 
 (defn fetch-semantic-scholar-recommendations
+  "Fetch paper recommendations from Semantic Scholar for a given paper-id."
   [paper-id]
   (try
+    (log/info "Fetching Semantic Scholar recommendations for paper ID:" paper-id)
     (let [url (str "https://api.semanticscholar.org/recommendations/v1/papers/forpaper/" paper-id)
-          api-key (System/getenv "SEMANTIC_SCHOLAR_API_KEY")
+          api-key (env-var "SEMANTIC_SCHOLAR_API_KEY")
           headers (if api-key
                     (assoc default-headers "x-api-key" api-key)
                     default-headers)
           resp (http/get url {:headers headers
                               :query-params {:limit 10
                                              :fields "title,authors,year,externalIds,citationCount,abstract,url,venue"}})
-          body (safe-json-parse (:body resp))]
-      (map (fn [item]
-             {:source "Semantic Scholar"
-              :id (:paperId item)
-              :title (:title item)
-              :doi (get-in item [:externalIds :DOI])
-              :year (:year item)
-              :authors (map :name (:authors item))
-              :venue (:venue item)
-              :abstract (:abstract item)
-              :citation-count (:citationCount item)
-              :url (:url item)})
-           (:recommendedPapers body)))
+          body (safe-json-parse (:body resp))
+          results (map (fn [item]
+                         {:source "Semantic Scholar"
+                          :id (:paperId item)
+                          :title (:title item)
+                          :doi (get-in item [:externalIds :DOI])
+                          :year (:year item)
+                          :authors (map :name (:authors item))
+                          :venue (:venue item)
+                          :abstract (:abstract item)
+                          :citation-count (:citationCount item)
+                          :url (:url item)})
+                       (:recommendedPapers body))]
+      (log/info "Semantic Scholar recommendations returned" (count results) "results")
+      results)
     (catch Exception e
       (log-error "Semantic Scholar recommendations error:" (.getMessage e))
       [])))
@@ -160,39 +193,46 @@
 ;; ==========================================
 
 (defn search-crossref
+  "Search papers on Crossref using the provided query."
   [query]
   (try
+    (log/info "Searching Crossref for query:" query)
     (let [url "https://api.crossref.org/works"
           resp (http/get url {:headers default-headers
                               :query-params {:query query
                                              :rows 10}})
-          body (safe-json-parse (:body resp))]
-      (map (fn [item]
-             {:source "Crossref"
-              :id (:DOI item)
-              :title (first (:title item))
-              :doi (:DOI item)
-              :year (get-in item [:created :date-parts 0 0])
-              :authors (map (fn [author]
-                              (str (:given author) " " (:family author)))
-                            (:author item))
-              :venue (first (:container-title item))
-              :citation-count (:is-referenced-by-count item)})
-           (get-in body [:message :items])))
+          body (safe-json-parse (:body resp))
+          results (map (fn [item]
+                         {:source "Crossref"
+                          :id (:DOI item)
+                          :title (first (:title item))
+                          :doi (:DOI item)
+                          :year (get-in item [:created :date-parts 0 0])
+                          :authors (map (fn [author]
+                                          (str (:given author) " " (:family author)))
+                                        (:author item))
+                          :venue (first (:container-title item))
+                          :citation-count (:is-referenced-by-count item)})
+                       (get-in body [:message :items]))]
+      (log/info "Crossref query returned" (count results) "results")
+      results)
     (catch Exception e
       (log-error "Crossref search error:" (.getMessage e))
       [])))
 
 
 (defn fetch-citation-format
+  "Resolve the citation details of a DOI in a specific citation format MIME type."
   [doi format-mime]
   (try
+    (log/info "Fetching citation format" format-mime "for DOI:" doi)
     (let [clean-doi (string/replace doi #"https?://(dx\.)?doi\.org/" "")
           url (str "https://doi.org/" clean-doi)
           resp (http/get url {:headers (assoc default-headers "Accept" format-mime)
                               :follow-redirects true})]
       (:body resp))
     (catch Exception e
+      (log/error e "Error fetching citation format")
       (str "Error fetching citation: " (.getMessage e)))))
 
 
@@ -201,17 +241,20 @@
 ;; ==========================================
 
 (defn extract-child-content
+  "Helper to extract content of a specific tag from a parsed XML entry."
   [entry tag-name]
   (first (mapcat :content (filter #(= (:tag %) tag-name) (:content entry)))))
 
 
 (defn extract-authors
+  "Helper to extract list of author names from a parsed arXiv XML entry."
   [entry]
   (let [authors (filter #(= (:tag %) :author) (:content entry))]
     (map (fn [a] (first (mapcat :content (filter #(= (:tag %) :name) (:content a))))) authors)))
 
 
 (defn parse-arxiv-xml
+  "Parse arXiv XML response string into tag maps."
   [xml-str]
   (try
     (let [parsed (xml/parse (ByteArrayInputStream. (.getBytes xml-str "UTF-8")))]
@@ -222,32 +265,36 @@
 
 
 (defn search-arxiv
+  "Search papers on arXiv using the export query API."
   [query]
   (try
+    (log/info "Searching arXiv for query:" query)
     (let [url "https://export.arxiv.org/api/query"
           resp (http/get url {:headers default-headers
                               :query-params {:search_query (str "all:" query)
                                              :max_results 10}})
-          entries (parse-arxiv-xml (:body resp))]
-      (map (fn [entry]
-             (let [id (extract-child-content entry :id)
-                   title (extract-child-content entry :title)
-                   summary (extract-child-content entry :summary)
-                   published (extract-child-content entry :published)
-                   year (when published (subs published 0 4))]
-               {:source "arXiv"
-                :id id
-                :title (when title (string/trim (string/replace title #"\n" " ")))
-                :doi nil
-                :year (when year (Integer/parseInt year))
-                :authors (extract-authors entry)
-                :venue "arXiv"
-                :abstract (when summary (string/trim (string/replace summary #"\n" " ")))
-                :citation-count 0
-                :url id
-                :is-oa true
-                :oa-url id}))
-           entries))
+          entries (parse-arxiv-xml (:body resp))
+          results (map (fn [entry]
+                         (let [id (extract-child-content entry :id)
+                               title (extract-child-content entry :title)
+                               summary (extract-child-content entry :summary)
+                               published (extract-child-content entry :published)
+                               year (when published (subs published 0 4))]
+                           {:source "arXiv"
+                            :id id
+                            :title (when title (string/trim (string/replace title #"\n" " ")))
+                            :doi nil
+                            :year (when year (Integer/parseInt year))
+                            :authors (extract-authors entry)
+                            :venue "arXiv"
+                            :abstract (when summary (string/trim (string/replace summary #"\n" " ")))
+                            :citation-count 0
+                            :url id
+                            :is-oa true
+                            :oa-url id}))
+                       entries)]
+      (log/info "arXiv query returned" (count results) "results")
+      results)
     (catch Exception e
       (log-error "arXiv search error:" (.getMessage e))
       [])))
@@ -258,8 +305,10 @@
 ;; ==========================================
 
 (defn search-pubmed
+  "Search papers on PubMed using esearch and esummary APIs."
   [query]
   (try
+    (log/info "Searching PubMed for query:" query)
     (let [search-url "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi"
           search-resp (http/get search-url {:headers default-headers
                                             :query-params {:db "pubmed"
@@ -275,25 +324,29 @@
                                                                  :id (string/join "," ids)
                                                                  :retmode "json"}})
               summary-body (safe-json-parse (:body summary-resp))
-              results (get-in summary-body [:result])]
-          (keep (fn [id]
-                  (let [doc (get results (keyword id))]
-                    (when doc
-                      {:source "PubMed"
-                       :id id
-                       :title (:title doc)
-                       :doi (first (keep (fn [articleid]
-                                           (when (= (:idtype articleid) "doi")
-                                             (:value articleid)))
-                                         (:articleids doc)))
-                       :year (when (:pubdate doc) (subs (:pubdate doc) 0 4))
-                       :authors (map :name (:authors doc))
-                       :venue (:source doc)
-                       :abstract nil ; esummary does not contain full abstract
-                       :citation-count 0
-                       :url (str "https://pubmed.ncbi.nlm.nih.gov/" id "/")})))
-                ids))
-        []))
+              results (get-in summary-body [:result])
+              parsed (keep (fn [id]
+                             (let [doc (get results (keyword id))]
+                               (when doc
+                                 {:source "PubMed"
+                                  :id id
+                                  :title (:title doc)
+                                  :doi (first (keep (fn [articleid]
+                                                      (when (= (:idtype articleid) "doi")
+                                                        (:value articleid)))
+                                                    (:articleids doc)))
+                                  :year (when (:pubdate doc) (subs (:pubdate doc) 0 4))
+                                  :authors (map :name (:authors doc))
+                                  :venue (:source doc)
+                                  :abstract nil ; esummary does not contain full abstract
+                                  :citation-count 0
+                                  :url (str "https://pubmed.ncbi.nlm.nih.gov/" id "/")})))
+                           ids)]
+          (log/info "PubMed query returned" (count parsed) "results")
+          parsed)
+        (do
+          (log/info "PubMed query returned 0 results")
+          [])))
     (catch Exception e
       (log-error "PubMed search error:" (.getMessage e))
       [])))
@@ -304,28 +357,34 @@
 ;; ==========================================
 
 (defn search-springer
+  "Search papers on Springer Nature metadata API (requires SPRINGER_API_KEY)."
   [query]
-  (if-let [api-key (System/getenv "SPRINGER_API_KEY")]
+  (if-let [api-key (env-var "SPRINGER_API_KEY")]
     (try
+      (log/info "Searching Springer Nature for query:" query)
       (let [url "https://api.springernature.com/metadata/v1/json"
             resp (http/get url {:headers default-headers
                                 :query-params {:q query
                                                :api_key api-key
                                                :p 10}})
-            body (safe-json-parse (:body resp))]
-        (map (fn [item]
-               {:source "Springer Nature"
-                :id (:doi item)
-                :title (:title item)
-                :doi (:doi item)
-                :year (when (:publicationDate item) (subs (:publicationDate item) 0 4))
-                :authors (map :creator (:creators item))
-                :venue (:publicationName item)
-                :abstract (:abstract item)
-                :citation-count 0
-                :is-oa (= (:openaccess item) "true")})
-             (:records body)))
+            body (safe-json-parse (:body resp))
+            results (map (fn [item]
+                           {:source "Springer Nature"
+                            :id (:doi item)
+                            :title (:title item)
+                            :doi (:doi item)
+                            :year (when (:publicationDate item) (subs (:publicationDate item) 0 4))
+                            :authors (map :creator (:creators item))
+                            :venue (:publicationName item)
+                            :abstract (:abstract item)
+                            :citation-count 0
+                            :is-oa (= (:openaccess item) "true")})
+                         (:records body))]
+        (log/info "Springer Nature query returned" (count results) "results")
+        results)
       (catch Exception e
         (log-error "Springer search error:" (.getMessage e))
         []))
-    []))
+    (do
+      (log/debug "Springer Nature search skipped: SPRINGER_API_KEY is not configured")
+      [])))
