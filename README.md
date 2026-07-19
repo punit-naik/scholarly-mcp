@@ -159,7 +159,7 @@ Add the server configuration to your `claude_desktop_config.json` file.
         "SPRINGER_API_KEY": "YOUR_SPRINGER_API_KEY",
         "SEMANTIC_SCHOLAR_API_KEY": "YOUR_SEMANTIC_SCHOLAR_API_KEY"
       },
-      "cwd": "/home/punit/Documents/work/personal/research-mcp"
+      "cwd": "/home/punit/Documents/work/personal/scholarly-mcp"
     }
   }
 }
@@ -174,7 +174,7 @@ Ensure you run `lein uberjar` first to compile the JAR.
       "command": "java",
       "args": [
         "-jar",
-        "/home/punit/Documents/work/personal/research-mcp/target/scholarly-mcp.jar"
+        "/home/punit/Documents/work/personal/scholarly-mcp/target/scholarly-mcp.jar"
       ],
       "env": {
         "SPRINGER_API_KEY": "YOUR_SPRINGER_API_KEY",
@@ -194,7 +194,7 @@ To configure the server in Cursor:
    - **Type:** `command`
    - **Command:**
      ```bash
-     java -jar /home/punit/Documents/work/personal/research-mcp/target/scholarly-mcp.jar
+     java -jar /home/punit/Documents/work/personal/scholarly-mcp/target/scholarly-mcp.jar
      ```
 4. Set Environment Variables for API Keys in the environment configuration of Cursor or your shell before launching Cursor:
    ```bash
