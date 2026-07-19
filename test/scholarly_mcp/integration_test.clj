@@ -1,14 +1,35 @@
 (ns scholarly-mcp.integration-test
   (:require
     [cheshire.core :as json]
+    [clojure.string :as string]
     [clojure.test :refer [deftest is testing]])
   (:import
     (java.io
       BufferedReader
       InputStreamReader
-      OutputStreamWriter)
+      OutputStreamWriter
+      PrintWriter)
     (java.lang
-      ProcessBuilder)))
+      ProcessBuilder)
+    (java.net
+      ServerSocket)))
+
+
+(defn start-mock-http-server
+  "Starts a simple, single-use TCP server that acts as a mock HTTP server on an ephemeral port."
+  []
+  (let [server (ServerSocket. 0)
+        port (.getLocalPort server)]
+    (future
+      (try
+        (with-open [socket (.accept server)
+                    out (PrintWriter. (.getOutputStream socket))]
+          (.print out "HTTP/1.1 200 OK\r\nContent-Type: text/html\r\n\r\n<html><body>Mock Integration Test Paper Content</body></html>")
+          (.flush out))
+        (catch Exception _e)
+        (finally
+          (.close server))))
+    port))
 
 
 (deftest stdio-integration-test
@@ -59,7 +80,32 @@
             ;; Verify our key tools are listed
             (is (contains? tool-names "search_papers"))
             (is (contains? tool-names "find_nature_papers_by_abstract"))
-            (is (contains? tool-names "compare_papers"))))
+            (is (contains? tool-names "compare_papers"))
+            (is (contains? tool-names "summarize_paper"))))
+
+        ;; 3. Send JSON-RPC tools/call for 'summarize_paper'
+        (let [port (start-mock-http-server)
+              call-req {:jsonrpc "2.0"
+                        :id 3
+                        :method "tools/call"
+                        :params {:name "summarize_paper"
+                                 :arguments {:url (str "http://localhost:" port "/paper.html")}}}
+              req-str (str (json/generate-string call-req) "\n")]
+          (.write writer req-str)
+          (.flush writer)
+
+          ;; Read response line
+          (let [res-str (.readLine reader)
+                res (json/parse-string res-str true)
+                content (get-in res [:result :content])
+                text (get-in (first content) [:text])]
+            (is (= "2.0" (:jsonrpc res)))
+            (is (= 3 (:id res)))
+            (is (seq content))
+            (is (or (string/includes? text "Mock Integration Test Paper Content")
+                    ;; Or if an LLM api key was present in the environment running the test, the LLM summary
+                    (string/includes? text "Mock")
+                    (string/includes? text "Paper")))))
 
         (finally
           ;; Clean up process

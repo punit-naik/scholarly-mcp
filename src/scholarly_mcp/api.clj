@@ -1,5 +1,5 @@
 (ns scholarly-mcp.api
-  "Academic database REST client integrations."
+  "Academic database REST client integrations and file extractors."
   (:require
     [cheshire.core :as json]
     [clj-http.client :as http]
@@ -8,7 +8,13 @@
     [clojure.xml :as xml])
   (:import
     (java.io
-      ByteArrayInputStream)))
+      ByteArrayInputStream)
+    (org.apache.pdfbox.pdmodel
+      PDDocument)
+    (org.apache.pdfbox.text
+      PDFTextStripper)
+    (org.jsoup
+      Jsoup)))
 
 
 (def default-headers
@@ -388,3 +394,92 @@
     (do
       (log/debug "Springer Nature search skipped: SPRINGER_API_KEY is not configured")
       [])))
+
+
+;; ==========================================
+;; Paper PDF/HTML Extraction & Summarization
+;; ==========================================
+
+(defn extract-pdf-text
+  "Extract text content from raw PDF bytes using Apache PDFBox."
+  [bytes]
+  (try
+    (log/info "Extracting text from PDF document using PDFBox")
+    (with-open [doc (PDDocument/load bytes)]
+      (let [stripper (PDFTextStripper.)]
+        (.getText stripper doc)))
+    (catch Exception e
+      (log-error "Failed to parse PDF using PDFBox:" (.getMessage e))
+      (throw e))))
+
+
+(defn extract-html-text
+  "Extract text content from HTML string using Jsoup."
+  [html-str]
+  (try
+    (log/info "Extracting text from HTML document using JSoup")
+    (let [doc (Jsoup/parse html-str)]
+      (-> doc .body .text))
+    (catch Exception e
+      (log-error "Failed to parse HTML using JSoup:" (.getMessage e))
+      (throw e))))
+
+
+(defn download-and-extract-paper
+  "Download a paper from URL (PDF or HTML) and extract its plain text content."
+  [url]
+  (try
+    (log/info "Downloading paper from URL:" url)
+    (let [resp (http/get url {:headers default-headers
+                              :as :byte-array
+                              :conn-timeout 15000
+                              :socket-timeout 15000
+                              :follow-redirects true})
+          content-type (get-in resp [:headers "content-type"] "")
+          content-type-lower (string/lower-case (or content-type ""))
+          bytes (:body resp)]
+      (cond
+        (or (string/includes? content-type-lower "application/pdf")
+            (string/ends-with? (string/lower-case url) ".pdf"))
+        (do
+          (log/info "Detected PDF content-type or URL pattern")
+          (extract-pdf-text bytes))
+
+        :else
+        (do
+          (log/info "Detected HTML content-type")
+          (extract-html-text (String. bytes "UTF-8")))))
+    (catch Exception e
+      (log-error "Error downloading/extracting paper from" url ":" (.getMessage e))
+      (throw e))))
+
+
+(defn summarize-text-fallback
+  "Generate a local fallback layout summary from raw text if no LLM key is configured."
+  [text]
+  (log/info "Generating fallback structural summary (no LLM keys configured)")
+  (let [lines (string/split-lines text)
+        clean-lines (map string/trim lines)
+        head (subs text 0 (min (count text) 6000))
+        tail (if (> (count text) 6000)
+               (subs text (- (count text) 4000))
+               "")
+        headings (->> clean-lines
+                      (filter (fn [line]
+                                (and (not (string/blank? line))
+                                     (< (count line) 60)
+                                     (re-matches #"^(?:[0-9]+\.?[0-9]*\s+[A-Z].*|[A-Z][A-Z0-9\s,\.\-\:]+)$" line))))
+                      (take 25))]
+    (str "## Fallback Document Extraction (No LLM Key Configured)\n\n"
+         "Configure `GEMINI_API_KEY`, `OPENAI_API_KEY`, or `ANTHROPIC_API_KEY` in the environment to get automated high-quality summary reports on the server.\n\n"
+         "### Document Structure / Section Headings Found:\n"
+         (if (empty? headings)
+           "* No clear heading patterns found.\n"
+           (string/join "\n" (map #(str "* " %) headings)))
+         "\n\n### Paper Excerpt (First 6,000 characters):\n```text\n"
+         head
+         "\n```\n\n"
+         (when (not (string/blank? tail))
+           (str "### Paper Excerpt (Last 4,000 characters):\n```text\n"
+                tail
+                "\n```\n")))))

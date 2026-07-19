@@ -16,6 +16,7 @@ The server exposes the following MCP tools to help AI assistants search, analyze
 5. `build_literature_review`: Synthesizes search results, grouping them by publication venue.
 6. `export_citations`: Retrieves formatted references in BibTeX or RIS formats.
 7. `find_nature_papers_by_abstract`: Recommends related Nature journal publications based on keywords extracted from an abstract.
+8. `summarize_paper`: Reuses `retrieve_full_text` to locate open-access PDFs/HTML, extracting full-text content and generating detailed summaries via the client's native sampling capability or server-side API keys (falling back to structured excerpts if no keys are configured).
 
 ---
 
@@ -47,6 +48,10 @@ This MCP server enables AI assistants (like Claude, ChatGPT, or custom agents) t
   > *"Based on my draft abstract, find similar papers published in Nature journals to help me decide where to submit."*
   The agent uses `find_nature_papers_by_abstract` (powered by local Apache Lucene keyword extraction) to recommend matching publications.
 
+* **Detailed Full-Text Paper Summaries**: When researchers need a deep summary of a paper's full text:
+  > *"Download and summarize the paper with DOI 10.1145/3703155"*
+  The agent will reuse `retrieve_full_text` to find the open access URL, download the PDF/HTML using `summarize_paper`, parse its contents with PDFBox or JSoup, and generate a detailed structured summary (highlighting core contribution, methodology, findings, and limitations) leveraging client-side LLM sampling or server fallbacks.
+
 ---
 
 ## Design Philosophy & Token Efficiency
@@ -77,9 +82,6 @@ To get the most out of the Research MCP Server, you should configure API keys fo
   2. Register for a free developer account.
   3. Create an application/project to obtain an **API Key**. Note that Springer Nature provides multiple key types (e.g., *Open Access API* and *Metadata API*). You must use the **Metadata API key** (Meta API) for this server.
 * **Environment Variable**: `SPRINGER_API_KEY`
-
-> [!WARNING]
-> Springer Nature API rate limits for the free/developer tier are very low (typically around 1–2 requests per second). Please use this key sparingly during development and testing to avoid receiving rate-limiting errors (HTTP 403 or 429).
 
 ### 2. Semantic Scholar API (`SEMANTIC_SCHOLAR_API_KEY`)
 * **Status**: **Optional**. The server works without an API key using the public endpoint, but requests will be subject to lower rate limits.
@@ -331,5 +333,3 @@ Copyright © 2026 [Punit Naik](https://github.com/punit-naik)
 This program and the accompanying materials are made available under the terms of the Eclipse Public License 2.0 which is available at http://www.eclipse.org/legal/epl-2.0.
 
 This Source Code may also be made available under the following Secondary Licenses when the conditions for such availability set forth in the Eclipse Public License, v. 2.0 are satisfied: GNU General Public License as published by the Free Software Foundation, either version 2 of the License, or (at your option) any later version, with the GNU Classpath Exception which is available at https://www.gnu.org/software/classpath/license.html.
-
-

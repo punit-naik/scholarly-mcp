@@ -8,7 +8,8 @@
     [plumcp.core.api.mcp-runtime :as mr]
     [plumcp.core.api.mcp-server :as ms]
     [plumcp.core.deps.runtime :as rt]
-    [scholarly-mcp.api :as api])
+    [scholarly-mcp.api :as api]
+    [scholarly-mcp.llm-api :as llm])
   (:import
     (java.io
       StringReader)
@@ -362,3 +363,141 @@
     (catch Exception e
       (log/error e "Error in find-nature-papers-by-abstract tool")
       (eg/make-call-tool-result [(eg/make-text-content (str "Error searching Nature papers: " (.getMessage e)))]))))
+
+
+;; ==========================================
+;; MCP Tool: summarize_paper
+;; ==========================================
+
+(defonce ^{:doc "Atom mapping JSON-RPC message request IDs to promises waiting for client sampling callbacks."}
+  pending-promises
+  (atom {}))
+
+
+(defn ^{:mcp-type :callback :mcp-name "summarize-paper-callback"} summarize-paper-callback
+  "Callback handler registered with the client to deliver the sampled message result."
+  [{:as result}]
+  (let [req-id (mr/get-request-id result)
+        p (get @pending-promises req-id)]
+    (log/info "Received summarize-paper-callback for request ID:" req-id)
+    (if p
+      (do
+        (log/info "Delivering result to pending promise for request ID:" req-id)
+        (deliver p result))
+      (log/warn "No pending promise found for request ID:" req-id))
+    (swap! pending-promises dissoc req-id)))
+
+
+(defn- client-supports-sampling?
+  "Check whether the current client supports native sampling capability."
+  [kwargs]
+  (let [supported (and (rt/has-session? kwargs)
+                       (boolean (get-in (ms/get-client-capabilities kwargs) [:sampling])))]
+    (log/debug "Client sampling support check:" supported)
+    supported))
+
+
+(defn- extract-text-from-sampling-result
+  "Extract content text from the client's sampling/createMessage result schema."
+  [result]
+  (let [content (:content result)]
+    (cond
+      (map? content) (:text content)
+      (coll? content) (:text (first content))
+      :else nil)))
+
+
+(defn- call-client-sampling
+  "Invoke the MCP client's sampling mechanism to prompt the user's host LLM."
+  [kwargs paper-text]
+  (log/info "Initiating client-side sampling request for paper summary")
+  (let [prompt-text (str "Summarize the following academic paper in detail. Highlight the core contribution, methodology, key findings, and limitations.\n\n"
+                         (subs paper-text 0 (min (count paper-text) 120000)))
+        sampling-msg (eg/make-sampling-message "user" (eg/make-text-content prompt-text))
+        request (eg/make-create-message-request
+                  [sampling-msg]
+                  2048
+                  :systemPrompt "You are an expert research scientist. Provide a clear, detailed, and structured summary of the academic paper.")
+        req-id (:id request)
+        p (promise)
+        callback-ctx (ms/make-callback-context "summarize-paper-callback")]
+    (swap! pending-promises assoc req-id p)
+    (try
+      (log/info "Sending sampling/createMessage request to client, ID:" req-id)
+      (ms/send-request-to-client kwargs request callback-ctx)
+      ;; Wait for up to 60 seconds for the response
+      (let [result (deref p 60000 :timeout)]
+        (if (= result :timeout)
+          (do
+            (log/warn "Client sampling request ID:" req-id "timed out after 60 seconds")
+            (swap! pending-promises dissoc req-id)
+            nil)
+          (do
+            (log/info "Successfully received sampling result from client for ID:" req-id)
+            (extract-text-from-sampling-result result))))
+      (catch Exception e
+        (log/error e "Error during client sampling invocation for ID:" req-id)
+        (swap! pending-promises dissoc req-id)
+        nil))))
+
+
+(defn ^{:mcp-name "summarize_paper" :mcp-type :tool} summarize-paper
+  "Extract and summarize the text of an academic paper using its DOI or direct URL."
+  [{:keys [^{:doc "The DOI of the paper" :type "string"} doi
+           ^{:doc "Direct URL to PDF or HTML page" :type "string"} url] :as kwargs}]
+  (try
+    (log/info "Calling summarize_paper tool with DOI:" doi "and URL:" url)
+    (cond
+      (and (string/blank? doi) (string/blank? url))
+      (do
+        (log/warn "summarize_paper received empty DOI and URL parameters")
+        (eg/make-call-tool-result [(eg/make-text-content "Either 'doi' or 'url' must be provided.")]))
+
+      :else
+      (let [target-url (cond
+                         (not (string/blank? url))
+                         url
+
+                         (not (string/blank? doi))
+                         (let [res (retrieve-full-text {:doi doi})
+                               report-text (-> res :content first :text)]
+                           (or (when report-text
+                                 (second (re-find #"\* \*\*OA URL:\*\* \[(https?://[^\]]+)\]" report-text)))
+                               (str "https://doi.org/" (clean-doi doi)))))]
+        (log/info "Resolved target URL for paper summarization:" target-url)
+        (if (string/blank? target-url)
+          (do
+            (log/warn "Could not resolve any valid URL for DOI:" doi)
+            (eg/make-call-tool-result [(eg/make-text-content (str "Could not resolve a valid URL for DOI: " doi))]))
+          (let [paper-text (api/download-and-extract-paper target-url)
+                _ (log/info "Successfully extracted paper text length:" (count paper-text))
+                summary-report (or (when (client-supports-sampling? kwargs)
+                                     (call-client-sampling kwargs paper-text))
+                                   ;; Fallback to server-side LLMs if configured, or text fallback
+                                   (let [gemini-key (api/env-var "GEMINI_API_KEY")
+                                         openai-key (api/env-var "OPENAI_API_KEY")
+                                         anthropic-key (api/env-var "ANTHROPIC_API_KEY")]
+                                     (cond
+                                       (not (string/blank? gemini-key))
+                                       (do
+                                         (log/info "Running fallback: Gemini server summary")
+                                         (llm/call-gemini-summary paper-text gemini-key))
+
+                                       (not (string/blank? openai-key))
+                                       (do
+                                         (log/info "Running fallback: OpenAI server summary")
+                                         (llm/call-openai-summary paper-text openai-key))
+
+                                       (not (string/blank? anthropic-key))
+                                       (do
+                                         (log/info "Running fallback: Anthropic server summary")
+                                         (llm/call-anthropic-summary paper-text anthropic-key))
+
+                                       :else
+                                       (do
+                                         (log/info "Running fallback: Local structural fallback summary")
+                                         (api/summarize-text-fallback paper-text)))))]
+            (eg/make-call-tool-result [(eg/make-text-content summary-report)])))))
+    (catch Exception e
+      (log/error e "Error in summarize-paper tool")
+      (eg/make-call-tool-result [(eg/make-text-content (str "Error summarizing paper: " (.getMessage e)))]))))
