@@ -1,0 +1,30 @@
+# Leiningen files
+pom.xml
+pom.xml.asc
+*jar
+/lib/
+/classes/
+/target/
+/checkouts/
+.lein-deps-state
+.lein-failures
+.lein-plugins
+.lein-repl-history
+
+# IDE/Editor files
+.lsp/
+.clj-kondo/
+.ccls-cache/
+.rebel_readline_history
+.nrepl-port
+.shadow-cljs/
+.calva/
+.vscode/
+.idea/
+*.iml
+.DS_Store
+
+# OS/System files
+*~
+#*
+.#*

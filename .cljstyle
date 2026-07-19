@@ -1,0 +1,3 @@
+{:rules {:indentation {:size 2}}
+ :paths ["src" "test"]
+ :files {:ignore #{#"\.clj-kondo/.*" #"\.lsp/.*" #"target/.*"}}}

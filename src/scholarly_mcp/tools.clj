@@ -1,0 +1,311 @@
+(ns scholarly-mcp.tools
+  (:require
+    [clj-http.client :as http]
+    [clojure.string :as string]
+    [plumcp.core.api.entity-gen :as eg]
+    [scholarly-mcp.api :as api])
+  (:import
+    (java.io
+      StringReader)
+    (org.apache.lucene.analysis.standard
+      StandardAnalyzer)
+    (org.apache.lucene.analysis.tokenattributes
+      CharTermAttribute)))
+
+
+;; ==========================================
+;; Utility Functions for Deduplication & Formatting
+;; ==========================================
+
+(defn clean-doi
+  [doi]
+  (when doi
+    (-> (string/lower-case doi)
+        (string/replace #"https?://(dx\.)?doi\.org/" "")
+        (string/trim))))
+
+
+(defn clean-title
+  [title]
+  (when title
+    (-> (string/lower-case title)
+        (string/replace #"[^a-z0-9]" "")
+        (string/trim))))
+
+
+(defn deduplicate-papers
+  [papers]
+  (let [by-doi (group-by #(clean-doi (:doi %)) (filter :doi papers))
+        no-doi (filter #(nil? (:doi %)) papers)
+        ;; Merge papers with identical DOI
+        merged-doi (map (fn [[_ matches]]
+                          (reduce (fn [acc paper]
+                                    (cond-> acc
+                                      (and (not (:abstract acc)) (:abstract paper)) (assoc :abstract (:abstract paper))
+                                      (> (:citation-count paper) (or (:citation-count acc) 0)) (assoc :citation-count (:citation-count paper))
+                                      (:is-oa paper) (assoc :is-oa (:is-oa paper) :oa-url (:oa-url paper))
+                                      (:url paper) (assoc :url (:url paper))))
+                                  (first matches)
+                                  (rest matches)))
+                        by-doi)
+        all-candidates (concat merged-doi no-doi)
+        ;; Finally group by cleaned title to catch duplicates without DOIs
+        by-title (group-by #(clean-title (:title %)) all-candidates)]
+    (map (fn [[_ matches]]
+           (first matches))
+         by-title)))
+
+
+(defn format-paper-markdown
+  [paper]
+  (let [cleaned-doi (clean-doi (:doi paper))]
+    (str "### " (:title paper) "\n"
+         "* **Authors:** " (string/join ", " (:authors paper)) "\n"
+         "* **Year:** " (:year paper) " | **Venue:** " (:venue paper) "\n"
+         "* **Citations:** " (:citation-count paper) "\n"
+         (when cleaned-doi (str "* **DOI:** [" cleaned-doi "](https://doi.org/" cleaned-doi ")\n"))
+         (when (:is-oa paper) (str "* **Open Access:** [Yes](" (or (:oa-url paper) (:url paper)) ")\n"))
+         (when (:abstract paper) (str "* **Abstract:** " (:abstract paper) "\n"))
+         "\n---\n")))
+
+
+;; ==========================================
+;; MCP Tool: search_papers
+;; ==========================================
+
+(defn ^{:mcp-name "search_papers" :mcp-type :tool} search-papers
+  "Search papers by topic across multiple academic indexes (OpenAlex, Semantic Scholar, arXiv, PubMed)."
+  [{:keys [^{:doc "Search query / topic" :type "string"} query]}]
+  (try
+    (if (string/blank? query)
+      (eg/make-call-tool-result [(eg/make-text-content "Query cannot be empty.")])
+      (let [oa-results (api/search-openalex query)
+            ss-results (api/search-semantic-scholar query)
+            arxiv-results (api/search-arxiv query)
+            pm-results (api/search-pubmed query)
+            springer-results (api/search-springer query)
+            crossref-results (api/search-crossref query)
+            all-results (concat oa-results ss-results arxiv-results pm-results springer-results crossref-results)
+            deduped (deduplicate-papers all-results)
+            sorted (sort-by :citation-count > deduped)
+            report-items (map format-paper-markdown (take 15 sorted))
+            report (str "# Search Results for: " query "\n\n"
+                        (if (empty? report-items)
+                          "No results found."
+                          (string/join "\n" report-items)))]
+        (eg/make-call-tool-result [(eg/make-text-content report)])))
+    (catch Exception e
+      (eg/make-call-tool-result [(eg/make-text-content (str "Error searching papers: " (.getMessage e)))]))))
+
+
+;; ==========================================
+;; MCP Tool: get_citations
+;; ==========================================
+
+(defn ^{:mcp-name "get_citations" :mcp-type :tool} get-citations
+  "Find papers citing a specific DOI."
+  [{:keys [^{:doc "The DOI of the paper" :type "string"} doi]}]
+  (try
+    (if (string/blank? doi)
+      (eg/make-call-tool-result [(eg/make-text-content "DOI cannot be empty.")])
+      (let [clean (clean-doi doi)
+            ;; Query OpenAlex citing API
+            url (str "https://api.openalex.org/works?filter=cites:https://doi.org/" clean)
+            resp (http/get url {:headers api/default-headers
+                                :query-params {:per_page 10}})
+            body (api/safe-json-parse (:body resp))
+            oa-citing (map (fn [item]
+                             {:title (:title item)
+                              :authors (map #(get-in % [:author :display_name]) (:authorships item))
+                              :year (:publication_year item)
+                              :venue (get-in item [:primary_location :source :display_name])
+                              :doi (:doi item)
+                              :citation-count (:cited_by_count item)})
+                           (:results body))
+            report-items (map format-paper-markdown (take 15 oa-citing))
+            report (str "# Papers citing DOI: " doi "\n\n"
+                        (if (empty? report-items)
+                          "No citing papers found in OpenAlex index."
+                          (string/join "\n" report-items)))]
+        (eg/make-call-tool-result [(eg/make-text-content report)])))
+    (catch Exception e
+      (eg/make-call-tool-result [(eg/make-text-content (str "Error fetching citations: " (.getMessage e)))]))))
+
+
+;; ==========================================
+;; MCP Tool: retrieve_full_text
+;; ==========================================
+
+(defn ^{:mcp-name "retrieve_full_text" :mcp-type :tool} retrieve-full-text
+  "Retrieve metadata and link to open access full text (PDF/HTML) if available."
+  [{:keys [^{:doc "The DOI of the paper" :type "string"} doi]}]
+  (try
+    (if (string/blank? doi)
+      (eg/make-call-tool-result [(eg/make-text-content "DOI cannot be empty.")])
+      (let [paper (api/fetch-openalex-by-doi doi)]
+        (if paper
+          (let [oa-status (if (:is-oa paper) "Open Access (Free to Read)" "Paywalled / Restricted")
+                report (str "# Paper Full-Text Lookup: " (:title paper) "\n\n"
+                            "* **Authors:** " (string/join ", " (:authors paper)) "\n"
+                            "* **Year:** " (:year paper) "\n"
+                            "* **Status:** " oa-status "\n"
+                            (when (:is-oa paper)
+                              (str "* **OA URL:** [" (or (:oa-url paper) (:url paper)) "](" (or (:oa-url paper) (:url paper)) ")\n"))
+                            (when (:abstract paper)
+                              (str "\n## Abstract\n" (:abstract paper) "\n"))
+                            "\n> Note: For PDFs, please use the OA URL to download the full PDF document directly.")]
+            (eg/make-call-tool-result [(eg/make-text-content report)]))
+          (eg/make-call-tool-result [(eg/make-text-content (str "Could not find paper with DOI " doi " in the OpenAlex database."))]))))
+    (catch Exception e
+      (eg/make-call-tool-result [(eg/make-text-content (str "Error retrieving full text: " (.getMessage e)))]))))
+
+
+;; ==========================================
+;; MCP Tool: compare_papers
+;; ==========================================
+
+(defn ^{:mcp-name "compare_papers" :mcp-type :tool} compare-papers
+  "Compare multiple papers side-by-side using their DOIs."
+  [{:keys [^{:doc "Comma-separated list of DOIs" :type "string"} dois]}]
+  (try
+    (if (string/blank? dois)
+      (eg/make-call-tool-result [(eg/make-text-content "Please provide at least one DOI.")])
+      (let [doi-list (map string/trim (string/split dois #","))
+            papers (keep api/fetch-openalex-by-doi doi-list)]
+        (if (seq papers)
+          (let [table-header (str "| Field | " (string/join " | " (map #(str "Paper " %1) (range 1 (inc (count papers))))) " |\n")
+                separator-line (str "| --- | " (string/join " | " (repeat (count papers) "---")) " |\n")
+                title-row (str "| Title | " (string/join " | " (map :title papers)) " |\n")
+                authors-row (str "| Authors | " (string/join " | " (map #(string/join ", " (take 2 (:authors %))) papers)) " |\n")
+                year-row (str "| Year | " (string/join " | " (map :year papers)) " |\n")
+                venue-row (str "| Venue | " (string/join " | " (map :venue papers)) " |\n")
+                citations-row (str "| Citations | " (string/join " | " (map :citation-count papers)) " |\n")
+                oa-row (str "| Open Access | " (string/join " | " (map #(if (:is-oa %) "Yes" "No") papers)) " |\n")
+
+                abstracts (string/join "\n\n" (map-indexed (fn [idx paper]
+                                                             (str "### Paper " (inc idx) ": " (:title paper) "\n"
+                                                                  (or (:abstract paper) "No abstract available.")))
+                                                           papers))
+                report (str "# Side-by-Side Paper Comparison\n\n"
+                            table-header separator-line title-row authors-row year-row venue-row citations-row oa-row "\n"
+                            "## Abstracts Comparison\n\n"
+                            abstracts)]
+            (eg/make-call-tool-result [(eg/make-text-content report)]))
+          (eg/make-call-tool-result [(eg/make-text-content "None of the provided DOIs could be resolved in OpenAlex.")]))))
+    (catch Exception e
+      (eg/make-call-tool-result [(eg/make-text-content (str "Error comparing papers: " (.getMessage e)))]))))
+
+
+;; ==========================================
+;; MCP Tool: build_literature_review
+;; ==========================================
+
+(defn ^{:mcp-name "build_literature_review" :mcp-type :tool} build-literature-review
+  "Synthesize and group papers for a literature review on a topic."
+  [{:keys [^{:doc "Topic search term" :type "string"} query]}]
+  (try
+    (if (string/blank? query)
+      (eg/make-call-tool-result [(eg/make-text-content "Query cannot be empty.")])
+      (let [oa-results (api/search-openalex query)
+            ss-results (api/search-semantic-scholar query)
+            merged (deduplicate-papers (concat oa-results ss-results))
+            sorted (sort-by :year > merged)
+            ;; Group by publication year decadal bands or just group by venue
+            by-venue (group-by :venue (take 15 sorted))
+            review-body (string/join "\n" (for [[venue venue-papers] by-venue
+                                                :when venue]
+                                            (str "### Venue: " venue "\n\n"
+                                                 (string/join "\n" (map (fn [p]
+                                                                          (str "* **" (:title p) "** (" (:year p) ") by " (string/join ", " (take 3 (:authors p))) "\n"
+                                                                               "  *Citation Count:* " (:citation-count p) "\n"
+                                                                               (when (:abstract p) (str "  *Summary:* " (subs (:abstract p) 0 (min (count (:abstract p)) 180)) "...\n"))))
+                                                                        venue-papers))
+                                                 "\n")))]
+        (eg/make-call-tool-result [(eg/make-text-content (str "# Literature Synthesis: " query "\n\n"
+                                                              "This report organizes the top recent papers found by publication venue to assist in drafting a literature review.\n\n"
+                                                              review-body))])))
+    (catch Exception e
+      (eg/make-call-tool-result [(eg/make-text-content (str "Error building literature review: " (.getMessage e)))]))))
+
+
+;; ==========================================
+;; MCP Tool: export_citations
+;; ==========================================
+
+(defn ^{:mcp-name "export_citations" :mcp-type :tool} export-citations
+  "Export references for DOIs in BibTeX or RIS format."
+  [{:keys [^{:doc "Comma-separated list of DOIs" :type "string"} dois
+           ^{:doc "Format: 'bibtex' or 'ris'" :type "string" :default "bibtex"} format]}]
+  (try
+    (if (string/blank? dois)
+      (eg/make-call-tool-result [(eg/make-text-content "DOIs list cannot be empty.")])
+      (let [doi-list (map string/trim (string/split dois #","))
+            mime-type (if (= (string/lower-case format) "ris")
+                        "application/x-research-info-systems"
+                        "application/x-bibtex")
+            citations (map (fn [doi]
+                             (str "% DOI: " doi "\n"
+                                  (api/fetch-citation-format doi mime-type) "\n"))
+                           doi-list)
+            report (string/join "\n" citations)]
+        (eg/make-call-tool-result [(eg/make-text-content report)])))
+    (catch Exception e
+      (eg/make-call-tool-result [(eg/make-text-content (str "Error exporting citations: " (.getMessage e)))]))))
+
+
+(defn extract-keywords
+  "Extract the top keywords from a text snippet using Lucene's StandardAnalyzer."
+  [text max-keywords]
+  (if (string/blank? text)
+    ""
+    (let [analyzer (StandardAnalyzer.)
+          token-stream (.tokenStream analyzer "field" (StringReader. text))
+          term-attr (.addAttribute token-stream CharTermAttribute)]
+      (try
+        (.reset token-stream)
+        (loop [words []]
+          (if (.incrementToken token-stream)
+            (recur (conj words (.toString term-attr)))
+            (->> words
+                 (filter #(> (count %) 3))
+                 (frequencies)
+                 (sort-by second >)
+                 (map first)
+                 (take max-keywords)
+                 (string/join " "))))
+        (finally
+          (.end token-stream)
+          (.close token-stream)
+          (.close analyzer))))))
+
+
+;; ==========================================
+;; MCP Tool: find_nature_papers_by_abstract
+;; ==========================================
+
+(defn ^{:mcp-name "find_nature_papers_by_abstract" :mcp-type :tool} find-nature-papers-by-abstract
+  "Find related Nature journal papers based on an abstract snippet."
+  [{:keys [^{:doc "The abstract text to search similarities for" :type "string"} abstract]}]
+  (try
+    (if (string/blank? abstract)
+      (eg/make-call-tool-result [(eg/make-text-content "Abstract cannot be empty.")])
+      (let [keywords (extract-keywords abstract 4)
+            ;; Search Nature papers on OpenAlex and Semantic Scholar using keywords
+            search-query (str keywords " venue:Nature")
+            results-oa (api/search-openalex search-query)
+            results-ss (api/search-semantic-scholar keywords)
+            combined (concat results-oa results-ss)
+            ;; Filter where venue name contains "Nature"
+            nature-papers (filter (fn [p]
+                                    (and (:venue p)
+                                         (string/includes? (string/lower-case (:venue p)) "nature")))
+                                  combined)
+            deduped (deduplicate-papers nature-papers)
+            report-items (map format-paper-markdown (take 10 (sort-by :citation-count > deduped)))
+            report (str "# Related Nature Papers found by Abstract Keywords (" keywords ")\n\n"
+                        (if (empty? report-items)
+                          "No related papers in Nature journals found."
+                          (string/join "\n" report-items)))]
+        (eg/make-call-tool-result [(eg/make-text-content report)])))
+    (catch Exception e
+      (eg/make-call-tool-result [(eg/make-text-content (str "Error searching Nature papers: " (.getMessage e)))]))))
